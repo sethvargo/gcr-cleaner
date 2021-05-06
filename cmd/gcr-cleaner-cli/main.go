@@ -18,14 +18,21 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
 	"regexp"
 	"runtime"
+	"strings"
 	"time"
 
+	"github.com/pkg/errors"
+
 	gcrauthn "github.com/google/go-containerregistry/pkg/authn"
-	gcrgoogle "github.com/google/go-containerregistry/pkg/v1/google"
 	"github.com/sethvargo/gcr-cleaner/pkg/gcrcleaner"
+
+	gcrname "github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/google"
+	gcrgoogle "github.com/google/go-containerregistry/pkg/v1/google"
+
+	"os"
 )
 
 var (
@@ -34,6 +41,7 @@ var (
 
 	tokenPtr       = flag.String("token", os.Getenv("GCRCLEANER_TOKEN"), "Authentication token")
 	repoPtr        = flag.String("repo", "", "Repository name")
+	registryPtr    = flag.String("registry", "", "Registry name")
 	gracePtr       = flag.Duration("grace", 0, "Grace period")
 	allowTaggedPtr = flag.Bool("allow-tagged", false, "Delete tagged images")
 	keepPtr        = flag.Int("keep", 0, "Minimum to keep")
@@ -50,8 +58,12 @@ func main() {
 }
 
 func realMain() error {
-	if *repoPtr == "" {
-		return fmt.Errorf("missing -repo")
+	if *repoPtr == "" && *registryPtr == "" {
+		return fmt.Errorf("missing -repo or -registry")
+	}
+
+	if *repoPtr != "" && *registryPtr != "" {
+		return fmt.Errorf("only use one of -repo or -registry flags")
 	}
 
 	if *allowTaggedPtr == false && *tagFilterPtr != "" {
@@ -89,13 +101,45 @@ func realMain() error {
 	}
 	since := time.Now().UTC().Add(sub)
 
-	// Do the deletion.
-	fmt.Fprintf(stdout, "%s: deleting refs since %s\n", *repoPtr, since)
-	deleted, err := cleaner.Clean(*repoPtr, since, *allowTaggedPtr, *keepPtr, tagFilterRegexp)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "%s: successfully deleted %d refs", *repoPtr, len(deleted))
+	var multierror []string
+	// walk through all repos in a registry
+	if *registryPtr != "" {
+		walkFn := func(repo gcrname.Repository, tags *google.Tags, err error) error {
+			repoName := repo.String()
+			// Do the deletion.
+			err = delete(&repoName, since, err, cleaner, tagFilterRegexp)
 
+			// if we have an error with one repo let's continue to gc others
+			if err != nil {
+				multierror = append(multierror, errors.Wrapf(err, "failed to delete repo %s", *registryPtr).Error())
+			}
+			return nil
+		}
+		srcRepo, err := gcrname.NewRepository(*registryPtr)
+		if err != nil {
+			return errors.Wrapf(err, "failed to create repo %s", *registryPtr)
+		}
+		if err := google.Walk(srcRepo, walkFn, google.WithAuth(auther)); err != nil {
+			return errors.Wrapf(err, "failed to walk repo %s", *registryPtr)
+		}
+		if len(multierror) > 0 {
+			return fmt.Errorf(strings.Join(multierror, "\n"))
+		}
+	} else {
+		// Do the deletion.
+		return delete(repoPtr, since, err, cleaner, tagFilterRegexp)
+	}
+
+	return nil
+
+}
+
+func delete(repo *string, since time.Time, err error, cleaner *gcrcleaner.Cleaner, tagFilterRegexp *regexp.Regexp) error {
+	fmt.Fprintf(stdout, "%s: deleting refs since %s in repo %s\n", *repoPtr, since, *repo)
+	deleted, err := cleaner.Clean(*repo, since, *allowTaggedPtr, *keepPtr, tagFilterRegexp)
+	if err != nil {
+		return errors.Wrapf(err, "failed to clean repo %s", *repo)
+	}
+	fmt.Fprintf(stdout, "%s: successfully deleted %d refs from repo %s\n", *repoPtr, len(deleted), *repo)
 	return nil
 }
